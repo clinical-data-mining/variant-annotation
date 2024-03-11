@@ -35,7 +35,7 @@ This analysis requires two main files:
 
 1. A clinical data file, containing patient-level clinical and demographic information, as well as outcome 
 
-2. A MAF file containing mutation information and additional columns that annotate each variant using OncoKB as well as any additional VEP of interest. For ease and consistency of comparing multiple methods, we obtained VEP predictions from dbNSFP (https://sites.google.com/site/jpopgen/dbNSFP). See `variant_annotation.R` for an example of an annotation workflow. You can annotate your MAF in other way - the only requirement is that there's a column specifying the category of each variant. 
+2. A MAF file containing mutation information and additional columns that annotate each variant using OncoKB as well as any additional VEP of interest.
 
 A gene alteration matrix (GAM) is optional if you wish to identify a list of genes to run the OS analysis on based on % of alteration. This is a binary matrix with samples as rows and genes as columns. 
 

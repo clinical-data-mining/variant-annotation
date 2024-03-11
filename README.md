@@ -6,15 +6,7 @@ This is the code repository accompanying the manuscript *Machine learning predic
 
 ***
 
-All analyses for the manuscript were performed in `R 4.2.2` (2022-10-21) and the following package versions:
-
-forcats_1.0.0      ranger_0.15.1      tidytext_0.4.1
-RColorBrewer_1.1-3 stringr_1.5.0      stringdist_0.9.10 
-survey_4.1-1       Matrix_1.5-1       cowplot_1.1.1     
-cobalt_4.4.1       WeightIt_0.13.1    survminer_0.4.9   
-ggpubr_0.6.0       survival_3.5-3     here_1.0.1        
-ggplot2_3.4.4      tidytable_0.9.2    corrplot_0.92     
-xtable_1.8-4       data.table_1.14.6
+All analyses for the manuscript were performed in `R 4.2.2` (2022-10-21) and the following package versions: data.table_1.14.6, survival_3.5-3, survminer_0.4.9, survey_4.1-1, WeightIt_0.13.1, ggplot2_3.4.4, forcats_1.0.0, ranger_0.15.1, tidytext_0.4.1, RColorBrewer_1.1-3, stringr_1.5.0, stringdist_0.9.10, Matrix_1.5-1, cowplot_1.1.1, cobalt_4.4.1, ggpubr_0.6.0, here_1.0.1, tidytable_0.9.2, corrplot_0.92, xtable_1.8-4       
 
 ## Components
 
