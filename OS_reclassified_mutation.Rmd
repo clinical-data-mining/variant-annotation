@@ -1,0 +1,218 @@
+---
+title: "OS stratification by reclassified mutation status"
+author: Thinh Tran
+output: html_document
+date: "2024-03-06"
+---
+
+## Set-up
+
+```{r setup, include=FALSE, eval=F}
+library(data.table)
+library(here)
+library(survival)
+library(survminer)
+library(tidytable)
+library(WeightIt)
+library(cobalt)
+library(cowplot)
+library(survey)
+library(stringdist)
+library(stringr)
+library(RColorBrewer)
+library(tidytext)
+library(corrplot)
+library(ranger)
+library(forcats)
+library(ggplot2)
+
+source("expanded_manuscript/public/utils.R")
+
+```
+
+## Load data
+This analysis requires two main files:
+
+1. A clinical data file, containing patient-level clinical and demographic information, as well as outcome 
+
+2. A MAF file containing mutation information and additional columns that annotate each variant using OncoKB as well as any additional VEP of interest. For ease and consistency of comparing multiple methods, we obtained VEP predictions from dbNSFP (https://sites.google.com/site/jpopgen/dbNSFP). See `variant_annotation.R` for an example of an annotation workflow. You can annotate your MAF in other way - the only requirement is that there's a column specifying the category of each variant. 
+
+A gene alteration matrix (GAM) is optional if you wish to identify a list of genes to run the OS analysis on based on % of alteration. This is a binary matrix with samples as rows and genes as columns. 
+
+```{r load data, eval=F}
+# Optional - binary gene alteration matrix
+load("/Users/thinhtran/Documents/Data/Parsed/gam.RData")
+
+# Clinical file
+load("/Users/thinhtran/Documents/Data/Genomics/NSCLC_IMPACT_clinical_subset.RData")
+
+# Annotated MAF
+load("/Users/thinhtran/Documents/Data/Genomics/all_missense_process_combined_0215.RData")
+
+# a list of variables to be used in inverse probability of treatment weighting - these should be the exact column names present in the clinical data file
+weighting_vars <-  c("AGE_AT_DX", "HAS_STAGE_IV_DX", "GENDER",
+                     "RACE", "HISTOLOGY", "SMOKING",
+                     "DIAGNOSIS_NUMBER_BINARY", "TMB_HIGH","MSI_HIGH" ,
+                     "EXTERNAL_TREATMENT_LABEL",
+                     grep("^METASTATIC_", colnames(pt_subset), value=T)))
+
+```
+
+
+## Run on IMPACT
+
+We can now run a series of weighted Cox PH models to stratify outcomes (in this case overall survival) by mutational status. 
+
+The underlying function that performs the IPTW and Cox PH regressions is `weightedSurvivalGeneList`, which can be modified in `utils.R`.
+
+```{r IMPACT OS, eval=F}
+
+# Define a list of columns to run on
+# These columns will be the left-hand side of a series of Cox PH models
+# Here, we include a column for binarized OncoKB status (oncogenic vs non-oncogenic) and reclassified status
+# according to different VEPs
+outcomes_rescue <- c("oncogenic_binary", "gene_of_interest",
+                     grep("Rescue", colnames(all_missense_process_extended), value=T))
+
+# Optional: if you have a binary GAM that can be used to calculate alteration frequency of the cohort to select frequently altered genes
+# Here we selected genes altered in >= 2% of the cohort (including alterations by mutations, fusions and indels)
+# if not, you can specify a list of gene names
+# the genes run in this manuscript are below
+# gene_to_run <- c("ALK", "APC","ARID1A","ARID2","ATM", "BRAF","CDKN2A",  "CTNNB1",  "EGFR",
+#                  "ERBB2",   "KEAP1", "KMT2D" , "KRAS",    "MET",     "MGA",     "NF1",
+#                  "NFE2L2",  "PIK3CA",  "PTEN",    "RB1" ,    "RBM10",   "RET",  "ROS1", "SETD2",  
+#                  "SMAD4", "SMARCA4", "STK11",   "TERT",    "TP53", "U2AF1")
+
+drivers <- gam[PATIENT_ID %in% pt_subset$PATIENT_ID, ]
+drivers <- drivers[, colSums(drivers != 0) > nrow(pt_subset)*0.02, with = FALSE]
+gene_to_run <- setdiff(colnames(drivers), c("PATIENT_ID", "Tumor_Sample_Barcode"))
+
+
+# Run a list of CoxPH 
+missense_surv_vus <- weightedSurvivalGeneList(maf=all_missense_process_extended, #genomic file
+                                         clinical = pt_subset, #clinical file
+                                         gene_to_run=gene_to_run, #list of genes to run
+                                         outcomes=outcomes_rescue, #list of left-hand side columns to stratify by
+                                         matching_vars=weighting_vars, #list of weighting variables
+                                         survobjform = "Surv(DTE_TO_SEQUENCING, OS_DURATION, event = OS_STATUS)", #survival formula passed on to coxph(), left truncated here at sequencing date
+                                         count_threshold = 10) #minimum number of patients in each strata to be included
+
+# Format result data.table for easy plotting
+missense_surv_dfs <- createPlotDFs(missense_surv_vus,
+                              gene_to_run = names(missense_surv_vus))
+
+# When created bubble plot, we only plot the coefficients of reclassified pathogenic vs. no mutation, so these coefficients are subset here
+impact_coefs_plot <- missense_surv_dfs$rescued[grepl("gene_of_interest|Pathogenic|Oncogenic", term),]
+
+# Isolate genes with at least one significant coefficient
+gene_with_coefs <- unique(impact_coefs_plot[!is.na(estimate_sig),]$gene)
+
+```
+
+
+## Run on GENIE
+We will run the same analysis on the non-MSK GENIE BPC cohort, except instead of all genes altered >= 2%, we will only look at genes significant in the IMPACT analyses to reduce the number of tests needed. 
+
+Since not all genes were sequenced in all panels within GENIE, we needed another file that specify which genes were included in which panels, so that in each gene-level analysis, we only include patients that were sequenced. This information, stored in `panel_info.RData`, was reformatted from the `genomic_information.txt` from GENIE to become a long data.table, which makes easier to subset patients.
+
+```{r GENIE validation, eval=F}
+
+# load clinical and genomic data
+load("/Users/thinhtran/Documents/Data/Parsed/GENIE_NSCLC_genomic_expanded_clinical.RData")
+genie_all_missense_process_extended <- genie_all_missense_process_extended[, oncogenic_binary := ifelse(oncogenic %in% c("Likely Oncogenic", "Oncogenic", "Resistance"), "Pathogenic","Non_pathogenic")]
+
+# load gene-panel information
+load("/Users/thinhtran/Documents/Data/GENIE_BPC/panel_info.RData")
+panel_presence <- melt(dcast(panels[Hugo_Symbol %in% impact_genes, ][, .(SEQ_ASSAY_ID, Hugo_Symbol)][, value := 1], SEQ_ASSAY_ID ~ Hugo_Symbol), variable.name = "Hugo_Symbol", value.name = "inPanel")
+
+# specify weighting variables
+# we tried to include as many variables as we could to reflect the weighting done on IMPACT, but certain variables such as metastasis sites are not readily available for this cohort
+weighting_vars_genie <- c("GENDER", "RACE", "HAS_STAGE_IV_DX", 
+                          "HISTOLOGY", "SMOKING", "AGE_AT_DX", 
+                          "DIAGNOSIS_NUMBER_BINARY", "PRIOR_TX")
+
+# identify genes with at least one significant coefficients from IMPACT analysis
+impact_genes <- unique(impact_coefs_plot[!is.na(estimate_sig),]$gene)
+outcomes_to_run <- gsub("1$|Pathogenic|Rescued_Oncogenic", "", unique(impact_coefs_plot[!is.na(estimate_sig),]$term))
+
+
+# #
+# colnames(genie_all_missense_process_extended) <- sub("Polyphen2_", "Polyphen2", colnames(genie_all_missense_process_extended))
+
+# run analysis
+missense_surv_genie <- weightedSurvivalGeneList(maf=genie_all_missense_process_extended,
+                                         clinical = pt_dates_nonmsk,
+                                         gene_to_run=impact_genes,
+                                         outcomes=outcomes_to_run,
+                                         matching_vars=weighting_vars_genie,
+                                         survobjform = "Surv(OS_MONTHS, event = OS_STATUS)",
+                                         panel_presence=panel_presence,
+                                         count_threshold = 4)
+
+# format for plotting
+genie_missense_surv_dfs <- createPlotDFs(missense_surv_genie,
+                              gene_to_run = impact_genes)
+
+genie_coefs_plot <- genie_missense_surv_dfs$rescued
+
+```
+
+## Compare with IMPACT
+We will now compare the OS HR from IMPACT and GENIE to identify what findings are replicated in both cohorts. 
+
+```{r IMPACT-GENIE comparison, eval=F}
+
+# create one large plotting df by merging results from IMPACT and GENIE
+coefs_plot <- merge(impact_coefs_plot, 
+                    genie_coefs_plot,
+                    suffixes = c("_IMPACT", "_GENIEBPC"),
+                    by=c("gene", "term"),
+                    all.x=T)
+
+# format border color by finding coefficients that were significant in both MSK-IMPACT and GENIE (replicated), coefficients that were significant in MSK-IMPACT and trending in the same direction in GENIE (trended) and coefficients that re not replicated
+coefs_plot <- coefs_plot[, GENIE_color := case.(!is.na(estimate_sig_IMPACT) & !is.na(estimate_sig_GENIEBPC) & sign(estimate_sig_IMPACT) == sign(estimate_GENIEBPC), "black",
+                                                !is.na(estimate_sig_IMPACT) & sign(estimate_sig_IMPACT) == sign(estimate_GENIEBPC), "blue",
+                                                
+                                                default="grey")]
+
+coefs_plot <- coefs_plot[, ann_type_IMPACT := case.(ann_type_IMPACT == "Gene", "Any missense mutation",
+                                                    default = ann_type_IMPACT)]
+
+coefs_plot <- coefs_plot[, mgroup := ifelse(grepl("Any|OncoKB", ann_type_IMPACT), "", "Re-classified")]
+
+# identify genes with significant coefficients as identified by VEPs
+gene_with_coefs <- unique(coefs_plot[!is.na(estimate_sig_IMPACT) & term != "gene_of_interest1",]$gene)
+
+```
+
+
+## Make bubble plot of hazard ratios
+This code produces Figure 2B from the merged IMPACT and GENIE data.table.
+
+```{r Plot, eval=F}
+
+ggplot(coefs_plot[gene %in% gene_with_coefs & !is.na(ann_type_IMPACT) & ann_type_IMPACT != "Any missense mutation",], 
+       aes(y=fct_rev(ann_type_IMPACT), x=gene, fill=estimate_sig_IMPACT)) +
+  geom_point(aes(size=strata_size_IMPACT, color=GENIE_color), pch=21, stroke=1.25)+
+  scale_fill_gradientn(colors = rev(hcl.colors(10, "RdBu")),
+                       na.value = "#f5f5f5",
+                       rescaler = ~ scales::rescale_mid(.x, mid = 1))+
+  scale_color_manual(values=c(brewer.pal(9, "Purples")[c(8,6)], "#f5f5f5"),
+                     labels=c("Significant (q-value <= 0.1)",
+                              "Estimates same direction",
+                              "Not replicated"))+
+  scale_size(range=c(2, 8), breaks = c(50, 500, 2000))+ # for patient count
+  labs(x="Gene", y="", color="GENIE replication", fill="OS HR", size = "Number of patients")+
+  theme_minimal()+
+  rotate_x_text(angle=90)+ 
+  facet_grid(mgroup ~., scales = "free", space = "free", switch = "y")+
+  theme(strip.background = element_rect(fill="lightgrey", color = "lightgrey"),
+        strip.placement = "outside")
+
+  theme(strip.background = element_blank(),
+        strip.text.y = element_blank())
+
+
+```
+
+

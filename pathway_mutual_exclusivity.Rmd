@@ -1,0 +1,309 @@
+---
+title: "Pathway mutual exclusivity for VEP annotation of cancer mutations"
+author: "Thinh Tran"
+output: html_document
+date: "2024-03-06"
+---
+
+## Call libraries
+```{r setup, eval=F}
+library(data.table)
+library(here)
+library(tidytable)
+library(cobalt)
+library(cowplot)
+library(stringdist)
+library(stringr)
+library(RColorBrewer)
+library(tidytext)
+library(zoo)
+library(forcats)
+
+source("utils.R")
+
+```
+
+
+## Load data
+Running this requires: 
+1. An annotated MAF file
+2. A list of pathways and genes in each pathway, curated from Sanchez-Vega et al. (Cell 2018)
+
+```{r load data, eval=F}
+# Load genomics data
+load("/Users/thinhtran/Documents/Data/Genomics/1011_impact_all_annotation_process.RData")
+
+# Load and process pathway information 
+pathways <- lapply(list.files("/Users/thinhtran/Documents/Data/Knowledge_Base/Pathways", full.names = T), function(x) fread(x))
+names(pathways) <- sapply(list.files("/Users/thinhtran/Documents/Data/Knowledge_Base/Pathways"), function(x) strsplit(x, split="\\.")[[1]][1])
+
+pathways_df <- list()
+for (i in 1:length(pathways)){
+  pathways_df[[i]] <- pathways[[i]][, .(Gene)][, Pathway := names(pathways)[i]]
+}
+
+pathways_df <- rbindlist(pathways_df)
+
+# Set up some constants
+ref_matrix <- matrix(c(1,1,2,2), nrow=2)
+methods <- unique(sapply(grep("numeric", colnames(all_missense_process_extended), value=T), function(x) strsplit(x, split="_")[[1]][1]))
+
+```
+
+## Functions
+
+```{r functions, eval=F}
+
+getpercent <- function(x) { return(round(x*100, 2)) }
+
+# Function that takes a gene list (presumably every gene in a pathway), a clinical and a genomic data frames
+# and return a list of dfs, each for a gene in the gene list, that includes, for each patient: the mutation with the highest annotation in the gene, its OncoKB and VEPs annotations, 
+# as well as clinical information for all patients in the clinical cohort
+processGeneList <- function(pathway, maf, clinical){
+  
+  gene_list <- intersect(pathways_df[Pathway == pathway, ]$Gene, unique(all_missense_process_extended$Hugo_Symbol))
+  
+  tmp_gene_process <- list()
+  
+  for (g in 1:length(gene_list)){
+    tmp_gene_process[[g]] <- prepareGenomicDF(maf = maf, clinical = clinical, gene=gene_list[g])[[1]]
+    tmp_gene_process[[g]] <- tmp_gene_process[[g]][, grepl("numeric|Hugo_Symbol|HGVSp_Short|SAMPLE_ID|_Rescue|", colnames(tmp_gene_process[[g]])), with=F]
+    tmp_gene_process[[g]] <- setnames(tmp_gene_process[[g]], colnames(tmp_gene_process[[g]]), paste0(gene_list[g], "_", colnames(tmp_gene_process[[g]])))
+    tmp_gene_process[[g]] <- setnames(tmp_gene_process[[g]], paste0(gene_list[g], "_SAMPLE_ID"), "SAMPLE_ID")
+  }
+  
+  return(tmp_gene_process)
+
+}
+
+# Function to clean up a result dataframe from mutual exclusivity test, calculate FDR and count the % of genes that is significant in the Fisher's test for mutual exclusivity
+resultDTProcess <- function(tmp_results, tmpp){
+  tmp_results <- tmp_results[, pval.adj := p.adjust(p.value, method = "fdr")][, pathway := tmpp]
+  tmp_count <- tmp_results[, length(which(pval.adj <= 0.1 & estimate < 1 | pval.adj <= 0.1 & is.infinite(estimate)))/length(tmp_gene_list), by=c("method", "pathway")]
+  tmp_count <- tmp_count[, method := case.(grepl("oncogenic", method), "OncoKB",
+                                           grepl("CADD", method), "CADD",
+                                           grepl("Clinvar", method), "ClinVar",
+                                           grepl("SIFT", method), "SIFT",
+                                           grepl("PolyPhen", method), "PolyPhen",
+                                           grepl("MA", method), "MutationAssessor",
+                                           grepl("AM", method), "AlphaMissense",
+                                           grepl("REVEL", method), "REVEL",
+                                           default=method)]
+  return(list(results=tmp_results, count=tmp_count))
+}
+
+# Function to clean up a list of pathway result df for plotting
+resultListProcess <- function(results_df, count_df) {
+  pathway_results_df <- rbindlist(results_df)
+  
+  pathway_count_df <- merge(pathway_results_df[, length(which(pval.adj <= 0.1 & estimate < 1 | pval.adj <= 0.1 & is.infinite(estimate))), by=c("method", "pathway")],
+                              pathway_results_df[, max(length(unique(gene))), by=c("pathway")], by="pathway")[, V1 := V1.x/V1.y]
+                              
+
+  pathway_count_df <- pathway_count_df[, method := ifelse(grepl("oncogenic", method), "OncoKB", method)]
+
+  pathway_count_df <- pathway_count_df[, method := relevel(factor(method), ref="OncoKB")]
+  
+  pathway_count_df <- pathway_count_df[, pathway := sub("_", " ", pathway)]
+  
+  return(list(results=pathway_results_df, count=pathway_count_df))
+}
+
+
+# Main function to calculate mutual exclusivity
+# The function takes a list of gene-level clinical/genomic data resulting from processGeneList() and runs a series of Fisher's test for mutual exclusivity
+testMutualExclusivity <- function(pathway, gene_list, methods,
+                                  comparison_side, # either "oncogenic" to test for reclassified oncogenic vs. oncogenic, or "benign" for reclassified benign vs oncogenic
+                                  pairwise=T) {
+  
+  tmp <- Reduce(function(x,y) merge(x,y, by="SAMPLE_ID", all=T), pathway)
+  
+    gene_results <- list()
+    for (g in 1:length(gene_list)){
+      anchor_gene <- gene_list[g] # one gene at a time
+      print(anchor_gene)
+      other_genes <- gene_list # test all other genes
+    
+      tmp_anchor <- tmp[, unique(c("SAMPLE_ID", 
+                          grep("Hugo_Symbol", colnames(tmp), value=T),
+                          grep(anchor_gene, colnames(tmp), value=T))), 
+                      with=F]
+        
+      anchor_column <- paste0(anchor_gene, "_oncogenic_numeric")
+    
+      method_results <- list()
+      
+      for (i in 1:length(methods)){
+        rescue_method <- methods[i]
+        print(rescue_method)
+
+      if (comparison_side == "oncogenic") {
+            if (rescue_method == "oncogenic"){
+            tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_column) == 1, 1, 0)] 
+            newgam <- gam_oncogenic[, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", other_genes), with=F]
+
+          } else  { # reclassified oncogenic vs known oncogenic
+            anchor_rescue <- paste0(anchor_gene,  "_", rescue_method, "_Rescue") 
+            tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_rescue)  == "Rescued_Oncogenic", 1, 0)]
+            newgam <- gam_oncogenic[, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", other_genes), with=F]
+          }
+        
+      } else if (comparison_side == "benign") {
+         if (rescue_method == "oncogenic"){
+            tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_column) == 0, 1, 0)] 
+            newgam <- gam_oncogenic[, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", other_genes), with=F]
+            
+          } else {
+            anchor_rescue <- paste0(anchor_gene,  "_", rescue_method, "_Rescue") 
+            tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_rescue) == "Rescued_Benign", 1, 0)]
+            newgam <- gam_oncogenic[, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", other_genes), with=F]
+          }
+        
+      }
+                  
+      tmp_anchor <- merge(tmp_anchor,
+                           newgam,
+                           by.x="SAMPLE_ID", by.y="Tumor_Sample_Barcode")
+
+      other_genes_included <- intersect(other_genes, colnames(tmp_anchor))
+      
+      tmp_anchor <- tmp_anchor[, other_gene_altered := as.integer(rowSums(.SD != 0) > 0),
+                    .SDcols=other_genes_included]
+      
+      if (pairwise == T){
+        tmp_anchor_subset <- lapply(other_genes_included, function(x) table(tmp_anchor[, c("anchor_gene_altered", x), with=F]))
+        names(tmp_anchor_subset) <- other_genes_included
+        tmp_anchor_subset <- tmp_anchor_subset[which(sapply(tmp_anchor_subset, function(x) identical(dim(x), dim(ref_matrix))) == T)]
+        test_df <- lapply(tmp_anchor_subset, function(x) setDT(tidy(fisher.test(x, alternative = "two.sided"))))
+        if (length(test_df) > 0){
+          for (t in 1:length(test_df)){
+          test_df[[t]] <- test_df[[t]][, `:=`(anchor_gene = anchor_gene, 
+                                              test_gene = names(tmp_anchor_subset)[t],
+                                              method = rescue_method)]
+          }
+          test_df <- rbindlist(test_df)
+        } else { test_df <- NULL }
+        
+      
+      } else {
+        
+         testxtab <- table(tmp_anchor[, .(anchor_gene_altered, other_gene_altered)])
+          
+         print(testxtab)
+         
+          if (identical(dim(testxtab), dim(ref_matrix))){
+                test_df <- setDT(tidy(fisher.test(testxtab, alternative = "two.sided")))
+                test_df <- test_df[, `:=`(gene = anchor_gene, method = rescue_method)]
+          } else { test_df <- NULL }
+      }
+      
+      method_results[[i]] <- test_df
+      
+      }
+      
+    gene_results[[g]] <- rbindlist(method_results)
+    
+    }
+    
+   results_df <- rbindlist(gene_results)[, `:=`(logOR = log(estimate),
+                                            logOR_lowCI = log(conf.low),
+                                            logOR_highCI = log(conf.high),
+                                            anchor_gene_mutations_included = side2)]
+      
+ return(results_df)
+
+}
+
+
+
+```
+
+
+# Mutual exclusivity test
+```{r}
+
+pathway_list_totest <- c("NRF2", "RTK_RAS", "TP53_Pathway")
+
+pathway_data <- pathway_results_oncogenic <- pathway_count_oncogenic <- pathway_results_benign <- pathway_count_benign <- list()
+
+method_list <- sub("_binary|_Rescue", "", grep("_binary|_Rescue", colnames(all_missense_process_extended), value=T))
+
+for (i in 1:length(pathway_list_totest)){
+  tmpp <- pathway_list_totest[i]
+  tmp_gene_list <- intersect(pathways_df[Pathway == tmpp, ]$Gene, unique(all_missense_process_extended$Hugo_Symbol))
+  cat("\n",tmpp)
+  tmp_pathway <- processGeneList(tmpp, maf=all_missense_process_extended,  clinical = pt_subset)
+
+  # tmp_pathway <- pathway_data[[i]]
+  
+  cat("\nTesting one vs all - oncogenic")
+
+  tmp_results <- testMutualExclusivity(pathway=tmp_pathway, #
+                                       gene_list=tmp_gene_list, 
+                                       methods = method_list,
+                                       comparison_side="oncogenic", 
+                                       pairwise = F, oncokb_included = F)
+
+  tmp_result_process <- resultDTProcess(tmp_results, tmpp)
+  
+  pathway_count_oncogenic[[i]] <- tmp_result_process$count
+  pathway_results_oncogenic[[i]] <- tmp_result_process$results
+  
+  cat("\nTesting one vs all - benign")
+
+  tmp_results <- testMutualExclusivity(pathway=tmp_pathway, gene_list=tmp_gene_list, 
+                                       side2="benign", pairwise = F, oncokb_included = F, methods = method_list)
+
+  tmp_result_process <- resultDTProcess(tmp_results, tmpp)
+  
+  pathway_count_benign[[i]] <- tmp_result_process$count
+  pathway_results_benign[[i]] <- tmp_result_process$results
+
+
+}
+
+
+# names(pathway_data) <- pathway_list_totest
+
+pathway_oncogenic <- resultListProcess(results_df = pathway_results_oncogenic,
+                                    count_df = pathway_count_oncogenic)
+
+pathway_benign <- resultListProcess(results_df = pathway_results_benign,
+                                    count_df = pathway_count_benign)
+
+```
+
+
+
+```{r}
+g1 <- ggplot(pathway_oncogenic$count, aes(y=fct_rev(method), x=pathway, fill=V1*100))+
+  geom_tile()+
+  scale_fill_gradientn(colors = brewer.pal(9, 'Blues'), na.value = "lightgrey", limits=c(0,70))+
+  theme_minimal() +
+  coord_fixed() +
+  rotate_x_text(angle=45)+
+  #facet_grid(~ method)+
+  labs(fill="% One vs all\nMutually exclusive", x="", y="Methods")+
+  theme(legend.position = "none")
+ 
+g2 <- ggplot(pathway_benign$count, aes(y=fct_rev(method), x=pathway, fill=V1*100))+
+  geom_tile()+
+  scale_fill_gradientn(colors = brewer.pal(9, 'Blues'), na.value = "lightgrey", limits=c(0,70))+
+  theme_minimal() +
+  coord_fixed() +
+  rotate_x_text(angle=45)+
+  #facet_grid(~ method)+
+  labs(fill="% One vs all\nMutually exclusive", x="", y="")
+
+plot_grid(g1, g2, nrow=1, align="h", axis="b", rel_widths = c(1, 1.15), labels="AUTO")
+
+ggsave(file="expanded_manuscript/Final_Figures/Raw_PDFs/pathway_exclusivity_results_one_vs_all_IMPACT.pdf",width=8,  height=5, units="in")
+  
+write.csv(pathway_oncogenic$results, file="expanded_manuscript/Final_Tables/pathway_exclusivity_results_one_vs_all_oncogenic.csv",
+          row.names = F)
+
+write.csv(pathway_benign$result, file="expanded_manuscript/Final_Tables/pathway_exclusivity_results_one_vs_all_benign.csv",
+          row.names = F)
+
+```
+
