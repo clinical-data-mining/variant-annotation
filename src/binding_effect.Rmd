@@ -1,0 +1,354 @@
+---
+title: "Binding_reclassified_mutation"
+output: html_document
+author: "Thinh Tran"
+date: "2024-10-08"
+---
+
+# Introduction
+This R script accompanies the manuscript *Machine learning cancer driver mutation predictions are valid in real-world data* (Tran et al., 2024). Pathogenic mutations can alter protein function by disrupting interactions with other proteins and ligands. This script leverages a curated database of residues involved in binding or protein-protein interaction (PPI) for proteins with available crystal structures and performs a series of Fisher's exact tests to probe whether reclassified pathogenic variants are enriched in binding residues.
+
+## Key functions:
+
+- Data preparation: Loading and merging genomic data with pre-processed protein-protein interaction (PPI) and binding residue data.
+- Fisher’s tests: Performing Fisher's exact tests to evaluate the association between reclassified mutations (pathogenic or benign) and whether they occur at binding residues.
+- Visualization: Plotting the results for different genes and methods, highlighting the proportion of mutations predicted to be oncogenic at binding residues and the statistical significance of these predictions.
+- Performance metrics: Calculating odds ratios (OR) for reclassified mutations to assess the ability of various tools to distinguish pathogenic from benign mutations.
+
+## How to run:
+- Load libraries and data: Ensure the required libraries and data are loaded.
+- Execute cells: Run each code block sequentially
+
+# Code
+## Set-up: call libraries and load data
+```{r setup}
+library(data.table)
+library(here)
+library(survival)
+library(survminer)
+library(tidytable)
+library(WeightIt)
+library(cobalt)
+library(cowplot)
+library(jskm)
+library(survey)
+library(stringdist)
+library(stringr)
+library(RColorBrewer)
+library(tidytext)
+library(corrplot)
+
+source("utils.R")
+
+# Load pre-processed dataframe of BioLiP and PPI databases
+load("/Users/thinhtran/Documents/Data/Protein/BioLiP_PPI_processed.RData")
+
+# Load genomics data
+load("/Users/thinhtran/Documents/Data/GENIE_v14/all_missense_process_extended_0903.RData")
+
+# Identify subset of genes with EVE and BoostDM scores
+# Since these methods have scores for a smaller number of genes, we want to run Fisher's tests on genes that actually have scores
+
+eve_genes <- unique(all_missense_process_extended[!is.na(EVE_score), ]$Hugo_Symbol)
+boostdm_genes <- unique(all_missense_process_extended[!is.na(BoostDM_score), ]$Hugo_Symbol)
+
+```
+
+## Merge genomic data with binding residue data
+
+We first merge our genomic missense mutations to the pre-processed binding residue database, calculates mutation counts, and compares computational method annotations.
+```{r}
+# Extract binding site residues from HGVSp_Short and keep the highest REVEL score per missense variant
+missense_binding <- all_missense_process_extended[,Binding_Site_Residues_PDB := sub("p\\.", "", substr(HGVSp_Short, 1, nchar(HGVSp_Short)-1))]
+missense_binding <- missense_binding[missense_binding[, .I[which.max(REVEL_numeric)], by=.(Hugo_Symbol, HGVSp_Short)]$V1]
+
+# Merge with Biolip binding site residues
+missense_binding <- merge(biolip_subset_residues[, Binding_Residue := T],
+                          missense_binding,
+                          by=c("Hugo_Symbol", "Binding_Site_Residues_PDB"),
+                          all=T)
+
+# Flag detected binding residues
+missense_binding  <- missense_binding[, detected_binding_residue := ifelse(!is.na(id) & !is.na(HGVSp_Short), T, F)]
+
+# Calculate counts of unique binding residues, mutations, and detected binding residues per gene
+missense_binding <- missense_binding[, `:=`(binding_residue_count = length(unique(Binding_Site_Residues_PDB[Binding_Residue == T])),
+                                            detected_mutation_count = length(unique(HGVSp_Short)),
+                                            detected_binding_residue_count = length(unique(HGVSp_Short[detected_binding_residue == T]))), 
+                                            by="Hugo_Symbol"]
+
+# Extract only columns related to Hugo_Symbol and counts
+binding_count <- unique(missense_binding[, grepl("Hugo_Symbol|count", colnames(missense_binding)), with=F])
+
+# Define methods for comparison and those related to rescue
+methods <- grep("Rescue|oncogenic_binary", colnames(all_missense_process_extended), value=T)
+methods_rescue <- grep("Rescue", colnames(all_missense_process_extended), value=T)
+
+# Loop over methods to calculate how many binding residues are predicted oncogenic by each method
+missense_binding_count <- lapply(methods, function(x) {
+  print(x)
+  merge(missense_binding[, length(unique(HGVSp_Short[detected_binding_residue == T])),
+                                            by=c("Hugo_Symbol", x)][, method := sub("_binary|_Rescue", "", x)], 
+        binding_count, by="Hugo_Symbol")
+})
+
+# Clean up and format the results for each method
+for (i in 1:length(missense_binding_count)){
+  missense_binding_count[[i]] <- setnames(missense_binding_count[[i]], colnames(missense_binding_count[[i]])[2], "annotation")
+  missense_binding_count[[i]] <- missense_binding_count[[i]][!is.na(annotation),]
+  missense_binding_count[[i]] <-  missense_binding_count[[i]][, annotated_fraction := V1/detected_binding_residue_count]
+}
+
+# Combine the results into a single data table
+missense_binding_count <- rbindlist(missense_binding_count)
+
+# Rename methods for better readability
+missense_binding_count <- rename_method(missense_binding_count)
+
+# Format annotation names for display
+missense_binding_count <- missense_binding_count[, annotation := sub("_", " ", sub("Rescued_", "Reclassified ", annotation))]
+
+# Add gene labels with counts of detected binding residues
+missense_binding_count <- missense_binding_count[, gene_labs := paste0(Hugo_Symbol, " (N=", detected_binding_residue_count, ")")]
+
+```
+
+
+## Gene-level annotation-binding association
+
+Here we process missense binding mutations, groups mutations by annotation status and their occurrence at binding sites, and conducts Fisher’s tests for significance.
+
+```{r gene level fisher}
+# Filter mutations that are present in data
+missense_binding_binary <- missense_binding[!is.na(HGVSp_Short),]
+
+# Filter for VUSs
+missense_binding_rescue <- missense_binding_binary[oncogenic_binary != "Pathogenic", ]
+
+# Create binary columns for each rescue method based on "Rescued_Oncogenic" status
+for (i in 1:length(methods_rescue)){
+  binary_colname <- paste0(methods_rescue[[i]], "_Binary")
+  missense_binding_rescue <- missense_binding_rescue[, eval(binary_colname) := ifelse(get(methods_rescue[[i]]) == "Rescued_Oncogenic", 1, 0)]
+}
+
+# Melt the data for rescued mutations, breaking down by binding status
+missense_binding_rescue_plot <- melt(missense_binding_rescue[, c("Hugo_Symbol", "HGVSp_Short", "detected_binding_residue", grep("_Rescue_Binary", colnames(missense_binding_rescue), value=T)), with=F], 
+                                     id.vars = c("Hugo_Symbol", "HGVSp_Short", "detected_binding_residue"))
+
+# Melt the data for all oncogenic mutations, breaking down by binding status
+missense_binding_oncogenic <-  melt(missense_binding[, .(Hugo_Symbol, HGVSp_Short, detected_binding_residue, oncogenic_binary)],
+                                     id.vars = c("Hugo_Symbol", "HGVSp_Short", "detected_binding_residue"))[!is.na(HGVSp_Short),][, value := ifelse(value == "Non_pathogenic", 0, 1)]
+
+# Combine rescued and oncogenic data
+missense_binding_rescue_plot <- rbind(missense_binding_rescue_plot, missense_binding_oncogenic)
+
+# Format the binary values and remove duplicates
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, value := factor(value, levels=c(1, 0))]
+missense_binding_rescue_plot <- unique(missense_binding_rescue_plot, by=c("Hugo_Symbol", "HGVSp_Short", "detected_binding_residue", "variable", "value"))
+
+# Clean up method names and add binding labels
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, method := gsub("_Rescue_Binary|_binary", "", variable)]
+missense_binding_rescue_plot <- rename_method(missense_binding_rescue_plot)
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, res_type := factor(ifelse(detected_binding_residue == T, "Binding", "Non-binding"), levels=c("Non-binding", "Binding"))]
+
+### Fisher's test for mutual exclusivity analysis ###
+alltestdf <- list()
+for (i in 1:length(unique(missense_binding_rescue_plot$Hugo_Symbol))){
+  tmp_gene <- unique(missense_binding_rescue_plot$Hugo_Symbol)[i]
+  tmp_df <- missense_binding_rescue_plot[Hugo_Symbol == tmp_gene, ]
+  testdf <- list()
+  for (m in 1:length(unique(tmp_df$variable))){
+    testxtab <- table(tmp_df[variable == unique(tmp_df$variable)[m], ][, .(value, detected_binding_residue)])
+    if (identical(dim(testxtab), dim(ref_matrix))){
+      tmptest <- setDT(tidy(fisher.test(testxtab)))
+      tmptest <- tmptest[, `:=`(method = unique(tmp_df$variable)[m],
+                                gene = tmp_gene)] 
+    } else { tmptest <- NULL }
+    testdf[[m]] <- tmptest
+  }
+  alltestdf[[i]] <- rbindlist(testdf)
+}
+
+# Compile results from Fisher's test and adjust p-values
+alltestdf <- rbindlist(alltestdf)
+alltestdf <- alltestdf[, pval.adj := p.adjust(p.value, method = "fdr")]
+
+# Merge Fisher's test results into the main dataset
+missense_binding_rescue_plot <- merge(missense_binding_rescue_plot, 
+                                      alltestdf,
+                                      by.x = c("Hugo_Symbol", "variable"),
+                                      by.y = c("gene", "method"),
+                                      all.x=T)
+
+# Additional formatting for plotting
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, method := relevel(factor(method), ref="OncoKB")]
+missense_binding_rescue_plot <- merge(missense_binding_rescue_plot, 
+                                      binding_count[, .(Hugo_Symbol, detected_binding_residue_count)],
+                                      by="Hugo_Symbol")
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, gene_lab := paste0(Hugo_Symbol, "\n(Binding N=", detected_binding_residue_count, ")")]
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, Hugo_Symbol := reorder(factor(Hugo_Symbol), -detected_binding_residue_count)]
+
+# Define genes for plotting
+gene_plot <- c(binding_count[order(detected_binding_residue_count, decreasing = T)][1:4, ]$Hugo_Symbol,
+               "ERBB4", "SMARCA4", "KEAP1")
+
+# Annotate p-values and counts for plot labels
+missense_binding_annotation_gene <- unique(missense_binding_rescue_plot[, .(Hugo_Symbol, gene_lab, res_type, method, pval.adj)])
+missense_binding_annotation_gene <- missense_binding_annotation_gene[, lab := ifelse(pval.adj <= 0.1, "*", "")][Hugo_Symbol %in% gene_plot & res_type=="Binding",]
+
+missense_binding_count_annotation_gene <- missense_binding_rescue_plot[, length(unique(HGVSp_Short)), by=c("variable", "Hugo_Symbol", "res_type", "method", "gene_lab")][method %in% c("OncoKB", "AlphaMissense") & Hugo_Symbol %in% gene_plot, ]
+
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, value := factor(value, levels = c(0,1))]
+
+# Plot results broken down by genes and binding status
+ggplot() +
+  geom_bar(missense_binding_rescue_plot[Hugo_Symbol %in% gene_plot & method != "ClinVar", ], mapping = aes(x = res_type, fill = value), position = "fill") +
+  labs(y = "Percentage") +
+  scale_y_continuous(labels = scales::percent, limits = c(0,1.10), breaks = c(0, 0.5, 1)) +
+  scale_x_discrete() +
+  theme_classic()+
+  geom_text(data=missense_binding_annotation_gene[method != "ClinVar",], mapping=aes(y=1, label=lab, x=2))+
+  facet_grid(Hugo_Symbol ~ method, scales = "free", space = "free")+
+  rotate_x_text(angle=45)+
+  scale_fill_brewer(palette="Set2", name="Annotation", label=c("Non-pathogenic", "Pathogenic"), direction=1)+
+  labs(x="Residue type")
+
+```
+
+## Cohort level annotation-binding association
+
+This code performs Fisher’s tests on missense mutations across multiple annotation methods for all genes in the cohort.
+
+```{r cohort level fisher}
+# Initialize list to store test results for each method
+test_df <-  list()
+
+# Loop through methods and perform Fisher's test for detected binding residues vs. rescue/oncogenic status
+for (i in 1:length(methods)){
+  print(methods[[i]])
+  if (methods[[i]] == "oncogenic_binary"){
+    # Fisher's test for oncogenic binary status
+    testxtab <- table(unique(missense_binding_binary, by=c("HGVSp_Short", "Hugo_Symbol"))[, .(detected_binding_residue, oncogenic_binary)])
+  } else if (methods[[i]] == "EVE_Rescue") {
+    # Fisher's test for EVE rescue method in specific genes
+    missense_binding_tmp <- unique(missense_binding_binary[oncogenic_binary != "Pathogenic" & Hugo_Symbol %in% eve_genes, ][, rescue_binary := ifelse(get(methods[[i]]) != "Rescued_Oncogenic", 0, 1)], , by=c("HGVSp_Short", "Hugo_Symbol"))
+    testxtab <- table(missense_binding_tmp[, .(detected_binding_residue, rescue_binary)])
+  } else if (methods[[i]] == "BoostDM_Rescue") {
+    # Fisher's test for BoostDM rescue method in specific genes
+    missense_binding_tmp <- unique(missense_binding_binary[oncogenic_binary != "Pathogenic" & Hugo_Symbol %in% boostdm_genes, ][, rescue_binary := ifelse(get(methods[[i]]) != "Rescued_Oncogenic", 0, 1)], , by=c("HGVSp_Short", "Hugo_Symbol"))
+    testxtab <- table(missense_binding_tmp[, .(detected_binding_residue, rescue_binary)])
+  } else {
+    # Fisher's test for other rescue methods
+    missense_binding_tmp <- unique(missense_binding_binary[oncogenic_binary != "Pathogenic", ][, rescue_binary := ifelse(get(methods[[i]]) != "Rescued_Oncogenic", 0, 1)], , by=c("HGVSp_Short", "Hugo_Symbol"))
+    testxtab <- table(missense_binding_tmp[, .(detected_binding_residue, rescue_binary)])
+  }
+  
+  # Conduct Fisher's test and store results in a list
+  propxtab <- prop.table(testxtab, margin=1)
+  test_df[[i]] <- setDT(tidy(fisher.test(testxtab)))
+  test_df[[i]] <- test_df[[i]][, method := sub("_binary|_Rescue", "", methods[[i]])]
+}
+
+# Combine test results and apply method renaming
+test_df <- rename_method(rbindlist(test_df))
+test_df <- test_df[, pval.adj.all := p.adjust(p.value, method = "fdr")]
+
+# Merge Fisher's test results with rescue plot data
+missense_binding_rescue_plot <- merge(missense_binding_rescue_plot, 
+                                      test_df[, .(method, pval.adj.all, estimate)][, logOR := round(log(estimate, base=10),2)],
+                                      by = "method",
+                                      all.x=T)
+
+# Add method labels for visualization
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, method_label := paste0(method, "\nlogOR = ", round(logOR, 2))]
+
+# Relevel methods for plotting
+oncokbref <- grep("OncoKB", unique(missense_binding_rescue_plot$method_label), value=T)
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, method_label := relevel(factor(method_label), ref=oncokbref)] 
+
+# Create annotation for p-values
+missense_binding_annotation <- unique(missense_binding_rescue_plot[, .(res_type, method, pval.adj.all)])
+missense_binding_annotation <- missense_binding_annotation[, lab_all := ifelse(pval.adj.all <= 0.05, "*", "")][res_type=="Binding",]
+missense_binding_annotation <- merge(missense_binding_annotation,
+                                      unique(missense_binding_rescue_plot[, .(method, method_label)]),
+                                 by="method")
+
+# Get count annotations for selected methods
+missense_binding_count_annotation <- missense_binding_rescue_plot[, length(unique(HGVSp_Short)), by=c("variable", "res_type", "method")][method %in% c("OncoKB", "AlphaMissense"), ]
+missense_binding_count_annotation <- merge(missense_binding_count_annotation,
+                                            unique(missense_binding_rescue_plot[, .(method, method_label)]),
+                                 by="method")
+
+# Format binary values for plotting
+missense_binding_rescue_plot <- missense_binding_rescue_plot[, value := factor(value, levels = c(0,1))]
+
+# Plot all alterations
+ggplot() +
+  geom_bar(missense_binding_rescue_plot[method != "ClinVar",], mapping = aes(x = res_type, fill = value), position = "fill") +
+  labs(y = "Percentage") +
+  scale_y_continuous(labels = scales::percent, limits = c(0,1.10), breaks = c(0, 0.5, 1)) +
+  scale_x_discrete() +
+  theme_classic() +
+  geom_text(data=missense_binding_annotation[method != "ClinVar",], mapping=aes(y=1, label=lab_all, x=2)) +
+  facet_grid( ~ method_label, scales = "free", space = "free") +
+  rotate_x_text(angle=45) +
+  scale_fill_brewer(palette="Set2", name="Annotation", label=c("Non-pathogenic", "Pathogenic"), direction=1) +
+  labs(x="Residue type")
+
+```
+
+
+## Calculate performance metrics: OR_binding
+
+To quantify performance of VEPs in reclassifying VUSs at binding residues to be pathogenic by calculating the odds ratio of reclassified pathogenic mutations occurring in a binding domain compared to reclassified benign mutations across all genes (OR_binding). This is essentially a Fisher's exact test that include all genes tested above. 
+
+```{r OR_binding calculation}
+### Odds ratio ###
+
+total_or <- rbind(pathway_oncogenic[, mutex := ifelse(pval.adj <= 0.05 & logOR <= 0, 1, 0)][, .N, by=.(mutex, method)][, rescue_oncogenic := 1],
+                  pathway_benign[, mutex := ifelse(pval.adj <= 0.05 & logOR <= 0, 1, 0)][, .N, by=.(mutex, method)][, rescue_oncogenic := 0])
+
+### Fisher's
+method_count <- total_or[, .N, by=method]
+
+data_split <- split(total_or[method %in% method_count[N ==4,]$method, ], by="method")
+
+fishers <- lapply(data_split, function(sub_data) {
+  # Create the 2x2 contingency table for mutex and rescue_oncogenic
+  table_data <- xtabs(N ~ mutex + rescue_oncogenic, data = sub_data)
+  print(table_data)
+  
+  # Perform Fisher's exact test
+  fisher_result <- fisher.test(table_data)
+  
+  # Return a data frame with the method name, p-value, odds ratio, and confidence intervals
+  data.frame(
+    method = unique(sub_data$method),
+    p_value = fisher_result$p.value,
+    odds_ratio = fisher_result$estimate,
+    conf_int_low = fisher_result$conf.int[1],
+    conf_int_high = fisher_result$conf.int[2]
+  )
+})
+
+# Combine the results into a single data frame
+fishers <- do.call(rbind, fishers)
+
+fishers <- setDT(fishers)
+fishers <- fishers[, method := ifelse(method == "VARITY_R_LOO", "VARITY", method)]
+
+# Plot
+ggplot(unique(fishers[!method %in% c("ClinVar", "oncogenic"),]),
+       aes(x=reorder(method, -odds_ratio), y=odds_ratio))+
+  geom_bar(stat="identity", position="dodge")+
+  theme_classic()+
+  scale_y_continuous(expand=c(0,0))+
+  geom_hline(yintercept = 1, color="red")+
+  geom_errorbar(aes(ymin=conf_int_low, ymax=conf_int_high), width=.2,
+               position=position_dodge(.9)) +
+  rotate_x_text(angle=45)+
+  labs(x="Method", y="Odds ratio of mutual exclusivity of\n reclassified oncogenic vs. reclassified benign mutations")
+
+
+```
+

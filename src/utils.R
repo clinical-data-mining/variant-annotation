@@ -1,106 +1,19 @@
+# Constants
 
-dbNSFP_cleanup <- function(genie_maf_annotated){
-  genie_maf_annotated <- setnames(genie_maf_annotated, "CADD_phred_hg19", "CADD_score")
-  
-  score_cols <- grep("_score", colnames(genie_maf_annotated), value=T)
-  min_cols <-  c("SIFT_score", "FATHMM_score", "ESM1b_score")
-  max_cols <- setdiff(score_cols, min_cols)
-  pred_cols <- grep("_pred", colnames(genie_maf_annotated), value=T)
-  
-  genie_maf_annotated <- genie_maf_annotated[, (score_cols) := lapply(.SD, as.numeric), .SDcols = score_cols]
-  
-  genie_maf_annotated <- genie_maf_annotated[, (max_cols) := lapply(.SD, function(x) max(x, na.rm=T)),
-                                             by = .(HGVSp_Short, Hugo_Symbol), .SDcols = max_cols]
-  
-  genie_maf_annotated <- genie_maf_annotated[, (min_cols) := lapply(.SD, function(x) min(x, na.rm=T)), 
-                                             by = .(HGVSp_Short, Hugo_Symbol), .SDcols = min_cols]
-  
-  genie_maf_annotated <- genie_maf_annotated[, (score_cols) := lapply(.SD, function(x) ifelse(is.infinite(x), NA, x)),
-                                             .SDcols = score_cols]
-  
-  genie_maf_annotated <- genie_maf_annotated[, (pred_cols) := lapply(.SD, function(x) ifelse(x==".", NA, x)), 
-                                             .SDcols = pred_cols]
-  
-  genie_maf_annotated <- genie_maf_annotated[, (pred_cols) := lapply(.SD, function(x) ifelse(all(is.na(x)), NA, na.omit(x)[1])), 
-                                             by = .(HGVSp_Short, Hugo_Symbol), .SDcols = pred_cols]
-  
-  genie_maf_annotated <- unique(genie_maf_annotated, by=c("Chromosome","Start_Position","Reference_Allele", "Tumor_Seq_Allele2","HGVSc_ANNOVAR", "HGVSp_Short", "Tumor_Sample_Barcode"))
-  
-  genie_maf_annotated <- genie_maf_annotated[, g := .GRP, by=c("Chromosome","Start_Position","Reference_Allele", "Tumor_Seq_Allele2","HGVSc_ANNOVAR", "HGVSp_Short")]
-  genie_maf_annotated <- genie_maf_annotated[, g_count := .N, by="g"]
-  
-  return(genie_maf_annotated)
-  
-}
-
+ref_matrix <- matrix(c(1,1,2,2), nrow=2)
 
 # Function to process dbNSFP label and standardize to a binary nomenclature system
-
 pred_to_label <- function(maf){
   pred_cols <- grep("pred", colnames(maf), value = T)
   for (i in 1:length(pred_cols)){
     method <- sub("_pred", "_pathogenic", pred_cols[i])
-    method_numeric <- sub("_pred", "_numeric", pred_cols[i])
     maf <- maf[, eval(method) := case.(get(pred_cols[i]) %in% c("T", "B", "L", "N"), "Non_pathogenic",
                                        get(pred_cols[i]) %in% c("D", "P", "H", "M"), "Pathogenic",
                                        default = "Unknown")]
-    maf <- maf[, eval(method_numeric) := case.(get(pred_cols[i]) %in% c("T", "B", "L", "N"), 0,
-                                               get(pred_cols[i]) %in% c("D", "P", "H", "M"), 1,
-                                               default = -1)]
   }
   return(maf)
 }
 
-determine_cutpoint <- function(genie_maf_annotated, method_col, direction){
-  
-  genie_maf_annotated <- setnames(genie_maf_annotated, "ONCOGENIC", "oncogenic", skip_absent = T)
-  
-  cadd_subset <- unique(genie_maf_annotated[oncogenic %in% c("Oncogenic", "Likely Oncogenic", "Resistance"), ], by=c("HGVSp_Short", "Hugo_Symbol"))
-  
-  cadd_subset <- cadd_subset[, oncogenic_binary := 1][, colnames(cadd_subset) %in% c("oncogenic_binary", "HGVSp_Short", "Hugo_Symbol", method_col), with=F]
-  
-  cadd_subset <- cadd_subset
-  
-  cadd_subset_binary <- rbind(cadd_subset[!is.na(get(method_col)),], 
-                              common_scores[, colnames(common_scores) == method_col, with=F][, oncogenic_binary := 0], fill=T)
-  
-  cadd_subset_binary <- cadd_subset_binary[, oncogenic_binary := as.character(oncogenic_binary)]
-  cadd_subset_binary <- cadd_subset_binary[, eval(method_col) := as.numeric(get(method_col))]
-  
-  cadd_subset_binary <- cadd_subset_binary[!is.na(get(method_col)),]
-  
-  cadd_cutpoint <- cutpointr(
-                             x=as.numeric(cadd_subset_binary[[method_col]]),
-                             class=cadd_subset_binary$oncogenic_binary,
-                             pos_class=1,
-                             neg_class=0,
-                             direction = direction,
-                             metric = sum_sens_spec,
-                             break_ties=median)
-  
-  pred_col <- sub("_score", "_pred", method_col)
-  numeric_col <- sub("_score", "_numeric", method_col)
-  
-  if (direction == ">="){
-    genie_maf_annotated <- genie_maf_annotated[, eval(pred_col) := ifelse(get(method_col) >= cadd_cutpoint$optimal_cutpoint, "D", "T")]
-    genie_maf_annotated <- genie_maf_annotated[, eval(numeric_col) := ifelse(get(method_col) >= cadd_cutpoint$optimal_cutpoint, 1, 0)]
-  } else {
-    genie_maf_annotated <- genie_maf_annotated[, eval(pred_col) := ifelse(get(method_col) <= cadd_cutpoint$optimal_cutpoint, "D", "T")]
-    genie_maf_annotated <- genie_maf_annotated[, eval(numeric_col) := ifelse(get(method_col) <= cadd_cutpoint$optimal_cutpoint, 1, 0)]
-  }
- 
-  
-  g1 <- plot_metric(cadd_cutpoint) +
-    theme_classic()+
-    labs(y="Sum of sensitivity and specificity", x="Prediction score", title=sub("_score", "", method_col), subtitle="")+
-    geom_vline(xintercept = cadd_cutpoint$optimal_cutpoint, color="blue", linetype="dashed")+
-    annotate("text", x = cadd_cutpoint$optimal_cutpoint - cadd_cutpoint$optimal_cutpoint*0.05, y = 1.03, 
-             label = paste0("Optimal cutoff:\n",round(cadd_cutpoint$optimal_cutpoint, 2)), 
-             color="blue", hjust=1, size=5)
-  
-  return(list(plot=g1, annotated_df=genie_maf_annotated))
-  
-}
 
 # Function to label MAF file and standardize OncoKB/VEP annotation columns into 3 main columns:
 # a "_score" column with raw prediction scores outputted by each method
@@ -108,16 +21,14 @@ determine_cutpoint <- function(genie_maf_annotated, method_col, direction){
 # a "_numeric" column where a variant is labeled 0 (non-pathogenic), 1 (pathogenic) or -1 (unknown) 
 maf_process <- function(maf){
   maf <- maf[HGVSp_Short != "", ][, colnames(maf) %in% c("Tumor_Sample_Barcode", "Hugo_Symbol", "Chromosome", "Start_Position", "HGVSc", 
-                                                         "HGVSp_Short", "SIFT", "PolyPhen", "Hotspot", "indel_hotspot", 
+                                                         "HGVSp_Short", "Hotspot", "indel_hotspot", 
                                                          "indel_hotspot_type", "oncogenic", "Highest_level", "PHRED", 
                                                          grep("numeric|pathogenic|score", colnames(maf), ignore.case=T, value=T)), with=F]
   
   
   maf <- maf[, PATIENT_ID := substr(Tumor_Sample_Barcode, 1, 9)]
   
-  maf <- maf[, oncogenic_numeric := case.(oncogenic %in% c("Likely Oncogenic", "Oncogenic", "Resistance"), 1,
-                                          oncogenic%in% c("Neutral", "Likely Neutral"), 0,
-                                          default = -1)]
+  maf <- maf[, oncogenic_numeric := ifelse(oncogenic %in% c("Likely Oncogenic", "Oncogenic", "Resistance"), 1, 0)]
   
   label_cols <- grep("label|pathogenic", colnames(maf), value = T)
   numeric_cols <- grep("numeric", colnames(maf), value=T)
@@ -144,8 +55,6 @@ maf_process <- function(maf){
                        SIFT_label_consolidated = str_to_title(gsub("_low_confidence", "", SIFT_label)))]
     
   }
-  
-
 
   maf <- maf[, oncogenic_consolidated := case.(oncogenic == "Likely Oncogenic", gsub("Likely ", "", oncogenic),
                                                oncogenic == "Likely Neutral", "Neutral",
@@ -159,7 +68,6 @@ maf_process <- function(maf){
   return(maf)
   
 }
-
 
 # Function to define reclassified/"rescued" mutation
 # This adds another column "_Rescue" to every VEP where VUSs (variants labeled as "Inconclusive" or not annotated by OncoKB) can be "Rescued_Oncogenic" 
@@ -199,11 +107,9 @@ define_rescue <- function(maf_process){
  
   return(maf_process)
   
-  
 }
 
-# Function to merge annotated MAF file with clinical file on a per-gene basis, fill in all columns for cases without mutation
-# For GENIE only: subset patients sequenced by a panel with the gene included only
+
 prepareGenomicDF <- function(maf, clinical, gene=NULL, panel_presence=NULL){
   
   # subset MAF by gene of interest
@@ -214,9 +120,8 @@ prepareGenomicDF <- function(maf, clinical, gene=NULL, panel_presence=NULL){
   }
   
   maf_subset <- maf_subset[Tumor_Sample_Barcode %in% clinical$SAMPLE_ID, ]
-  maf_subset <- maf_subset[, oncogenic_numeric := case.(oncogenic_consolidated %in% c("Likely Oncogenic", "Oncogenic", "Resistance"), 1,
-                                                        oncogenic_consolidated%in% c("Neutral", "Likely Neutral"), 0,
-                                                        default = -1)]
+  maf_subset <- maf_subset[, oncogenic_numeric := ifelse(oncogenic_consolidated %in% c("Likely Oncogenic", "Oncogenic", "Resistance"), 1,
+                                                       0)]
 
   # merge in with clinical df
   pt_subset <- merge(clinical, maf_subset,
@@ -229,10 +134,9 @@ prepareGenomicDF <- function(maf, clinical, gene=NULL, panel_presence=NULL){
                        by="SEQ_ASSAY_ID")
   }
 
-  # fill in the blanks for cases with no mutations for all columns 
+  # fill in the blanks for all columns
   
   text_cols <- grep("consolidated|pathogenic|Rescue|oncogenic_binary", colnames(pt_subset), value=T)
-  
   numeric_cols <- grep("numeric", colnames(pt_subset), value=T)
   
   pt_subset <- pt_subset[, (text_cols) := lapply(.SD, function(x) factor(ifelse(is.na(x), "No_mutation", x))), .SDcols = text_cols]
@@ -243,14 +147,15 @@ prepareGenomicDF <- function(maf, clinical, gene=NULL, panel_presence=NULL){
   
   pt_subset <- pt_subset[, gene_of_interest := factor(ifelse(is.na(Hugo_Symbol), 0, 1), levels=c(0,1))]
 
+  
   pt_subset <- pt_subset[, (text_cols) := lapply(.SD, function(x) relevel(x, ref="No_mutation")), .SDcols = text_cols]
   
-  # select only mutation with highest OncoKB annotation in case there are multiple mutations
+  # select only mutation with highest oncokb annotation in case there are multiple mutations
   if (!is.null(gene)){
     pt_subset <- pt_subset[pt_subset[, .I[which.max(oncogenic_numeric)], by=.(PATIENT_ID, Hugo_Symbol)]$V1]
   }
   
-  # calculate correlation between VEP vs. oncogenic prediction
+  # calculate correlation between protein vs. oncogenic prediction
   corr_matrix <- pt_subset[, grep("numeric", colnames(pt_subset), value=T), with=F]
   corr_matrix <- setnames(corr_matrix, colnames(corr_matrix), gsub("_numeric", "", colnames(corr_matrix)))
   corr_matrix <- setnames(corr_matrix, c("AM", "MA", "Clinvar", "oncogenic"),
@@ -267,92 +172,121 @@ prepareGenomicDF <- function(maf, clinical, gene=NULL, panel_presence=NULL){
 }
 
 
-# Function to do inverse probability of treatment weighting
-# Return weights to be used for downstream Cox's proportional hazard models or Kaplan-Meier curve
 calculateIPTWeights <- function(lhs, rhs, df, focal_level=NULL) {
   
-  # Specify matching formula
   matching_formula <- as.formula(paste0(lhs, "~", paste0(rhs, collapse=" + ")))
-
-  # Calculate weights using WeightIt package
-  weighted <- weightit(matching_formula,
+  
+  # pre_matched <- bal.tab(matching_formula,
+  #         data = clinical_pfs, estimand = "ATT", focal="LEVEL_1", thresholds = c(m = .2))
+  
+  if (!is.null(focal_level)) {
+    weighted <- weightit(matching_formula,
+                         data = df, estimand = "ATT",
+                         focal=focal_level,
+                         method = "ps")
+    
+  } else {
+    weighted <- weightit(matching_formula,
                          data = df, estimand = "ATE",
                          method = "ps")
+  }
   
-  # Diagnostic table for matching
   match_summary <-  bal.tab(weighted, stats = c("m", "v"), thresholds = c(m = .25))
   
-  # Love plot showing absolute mean differences before and after matching
   p <- love.plot(weighted, stars = "std",
                  abs=TRUE, line=T,
                  thresholds = c(m = .2),
                  limits=list(m = c(0, .5)),
-                 sample.names = c("Unweighted", "PS Weighted"),
+                 sample.names = c("Unweighted", "PS Weighted (ATT)"),
                  colors = c("grey", "black"))
+  
+  #non_balanced <- setDT(match_summary$Balance.Across.Pairs)[M.Threshold == "Not Balanced, >0.2", ]
+  
+  # if (match_summary$Balanced.mean.diffs["Not Balanced, >0.25",] > 5){
+  #    if (!is.null(focal_level)) {
+  #     weighted <- weightit(matching_formula,
+  #     data = df, estimand = "ATT",
+  #     focal=focal_level,
+  #     method = "gbm")
+  # 
+  # } else {
+  #     weighted <- weightit(matching_formula,
+  #     data = df, estimand = "ATE",
+  #     method = "gbm")
+  # }
+  # 
+  #   match_summary <- bal.tab(weighted, stats = c("m", "v"), thresholds = c(m = .2))
+  # }
+  
+  # p <- love.plot(weighted, stars = "std",
+  #           abs=TRUE, line=T,
+  #           thresholds = c(m = .2),
+  #           limits=list(m = c(0, .5)),
+  #           sample.names = c("Unweighted", "PS Weighted (ATT)"),
+  #           colors = c("grey", "black"))
   
   return(list(p,weighted))
 }
 
-# Function to run Cox's proportional hazard model and KM curve following IPTW for a single gene/outcome
-# Takes a merged clinical and genomics dataframe, a formula to be passed to coxph() or Surv(), and an object output by calculateIPTWeights()
+
 weightedSurvival <- function(df, survform, weighted) {
   
   cat("\nKM curve")
   
-  # Fit KM curve
+  # unweighted_km <- survfit(as.formula(survform), data=df)
+  # 
+  # s1 <- ggsurvplot(unweighted_km, risk.table = T, marks=T,
+  #                 xlabs = "Time (months)", ystrataname = "",
+  #                 data=df)
+  
   weighted_km <- do.call(survfit, list(formula=as.formula(survform), data=df,
                                        weights = weighted$weights))
   
-  # Plot
-  s1 <- do.call(ggsurvplot, list(fit=weighted_km, risk.table = T, marks=T, conf.int=T,
+  s2 <- do.call(ggsurvplot, list(fit=weighted_km, risk.table = T, marks=T, conf.int=T,
                                  xlabs = "Time (months)", ystrataname = "", 
                                  data=df))
   
   cat("\nModel PFS with Cox PH")
   
-  # Fit weighted Cox PH
+  print(survform)
+  
   weighted_cox=coxph(as.formula(survform),
                      data=df,weights=weighted$weights)
   
-  # Forest plot
-  g1 <- ggforest(weighted_cox, data=df, main="")
+  cox_noweight=coxph(as.formula(survform),
+                     data=df)
   
-  return_list <- list(s1, g1, weighted_km, weighted_cox)
+  g1 <- ggforest(weighted_cox, data=df, main="")
+  #g2 <- ggforest(cox_noweight, data=df, main="Hazard ratio (Unweighted)")
+  
+  #g_grid <- plot_grid(g2, g1, nrow=1)
+  
+  return_list <- list(s2, g1, weighted_km, weighted_cox)
   names(return_list) <- c("km_plot_weighted", "coxph_forest_plots", "km_object", "coxph_models")
   
   return(return_list)
   
 }
 
-# Function to run the whole pipeline for OS effect for a list of genes and a list of stratified variables
-# Starting with an annotated MAF and a clinical dataframe, this function merges the two on a per-gene basis
-# run IPTW and Cox PH, then return results as a list
 
 weightedSurvivalGeneList <- function(maf, clinical, gene_to_run, 
                                      outcomes, matching_vars,
                                      survobjform, 
-                                     panel_presence=NULL, #for GENIE only: allowing the subset of cases with a specific gene sequenced 
-                                     count_threshold, # minimum number of patients in each strata to be included
-                                     baseline="other") { # in case the baseline is different from "No_mutation" 
+                                     panel_presence=NULL,
+                                     count_threshold,
+                                     baseline="other"){
   
-  # loop through gene list
   surv_list_snv <- list()
   for (g in 1:length(gene_to_run)){
     temp_gene <- gene_to_run[g]
     cat("\n", temp_gene)
-    
-    # merge clinical and genomic, fill in missing values for cases with no mutation
     temp_df <- prepareGenomicDF(maf = maf, clinical = clinical, gene=temp_gene, panel_presence=panel_presence)
     
-    # loop through VEP/left-hand side variables
     surv_list <- list()
-    
     for (i in 1:length(outcomes)){
       tmp_outcome <- outcomes[i]
       print(tmp_outcome)
       
-      # This allows the specification of other comparisons instead of the usual mutation vs. no mutation comparison
-      # If run default, leave baseline blank
       if (baseline == "oncogenic"){
         rundf <- temp_df[[1]][get(tmp_outcome) %in% c("OncoKB_Oncogenic", "Rescued_Oncogenic"), ]
       } else if (baseline == "benign") {
@@ -361,26 +295,27 @@ weightedSurvivalGeneList <- function(maf, clinical, gene_to_run,
         rundf <- temp_df[[1]]
       }
       
-      # Remove strata with too few cases (below count_threshold)
-      outcome_level <- as.character(rundf[, .N, by=tmp_outcome][N >= count_threshold, ][[1]])
+      print(rundf[, .N, by=tmp_outcome])
+      outcome_level <- setdiff(as.character(rundf[, .N, by=tmp_outcome][N >= count_threshold, ][[1]]),
+                               "Unknown")
+      
       rundf <- rundf[rundf[[tmp_outcome]] %in% outcome_level, ]
       rundf[[tmp_outcome]] <- droplevels(rundf[[tmp_outcome]])
       
-      # calculate weights
       tmp_weights <- tryCatch(calculateIPTWeights(lhs = tmp_outcome,
                                                   rhs = matching_vars,
                                                   df = rundf),
                               error=function(e) NULL)
-      
-      # set baseline
+
+
       if (!is.null(tmp_weights)){
+        #print(tmp_weights[[1]])
         if (baseline == "oncogenic"){
           rundf[[tmp_outcome]] <- relevel(rundf[[tmp_outcome]], ref="OncoKB_Oncogenic") 
         } else if (baseline == "benign") {
           rundf[[tmp_outcome]] <- relevel(rundf[[tmp_outcome]], ref="No_mutation") 
         }
         
-        # run single model CoxPH
         surv_list[[i]] <- weightedSurvival(df=rundf, 
                                            survform=paste0(survobjform, "~", tmp_outcome), 
                                            weighted=tmp_weights[[2]])
@@ -389,7 +324,6 @@ weightedSurvivalGeneList <- function(maf, clinical, gene_to_run,
     surv_list_snv[[g]] <- surv_list
   }
   
-  # remove genes with blank coefficients due to having too few cases before returning
   gene_to_run_subset <- gene_to_run[sapply(surv_list_snv, function(x) length(x) > 0)]
   surv_list_snv <- surv_list_snv[sapply(surv_list_snv, function(x) length(x) > 0)]
   names(surv_list_snv) <-  gene_to_run_subset
@@ -400,7 +334,9 @@ weightedSurvivalGeneList <- function(maf, clinical, gene_to_run,
 }
 
 
+
 # Function to format the result table from weightedSurvivalGeneList into a table with nice variable names for plotting
+
 createPlotDFs <- function(surv_list, gene_to_run){
   coxph_coeffs <- lapply(surv_list, function(x) lapply(x, function(y) as.data.frame(tidy(y$coxph_models, conf.int = TRUE))))
   count_dfs <- lapply(surv_list, function(x) lapply(x, function(y) unique(setDT(y$km_plot_weighted[["table"]][["data"]])[, .(strata, strata_size)])))
@@ -420,9 +356,7 @@ createPlotDFs <- function(surv_list, gene_to_run){
                               hr.conf.low=exp(conf.low),
                               hr.conf.high=exp(conf.high))]
   coefs_df <- coefs_df[, pval_adj := p.adjust(p.value, method = "fdr")]
-  coefs_df <- coefs_df[, estimate_sig := ifelse(pval_adj <= 0.1, hr, NA)]
-  #gene_with_coefs <- unique(coefs_df[!is.na(estimate_sig),]$gene)
-  
+  coefs_df <- coefs_df[, estimate_sig := ifelse(pval_adj <= 0.2, hr, NA)]
   
   coefs_df <- coefs_df[, y_lab := gsub("_label_|consolidated|_|_of_interest1", " ", term)]
   coefs_df <- coefs_df[, y_lab := sub("  ", ": ", y_lab)]
@@ -439,12 +373,9 @@ createPlotDFs <- function(surv_list, gene_to_run){
 
   coefs_rescued <- coefs_df[grepl("RescueRescued_Oncogenic|RescueRescued_Benign|oncogenic_binaryPathogenic|oncogenic_binaryNon_pathogenic|gene_of_interest1|any_VUS1", term), ]
   coefs_rescued <- coefs_rescued[, ann_type := case.(grepl("OncoKB|oncogenic_binary", term), "OncoKB",
-                                                                   grepl("Clinvar", term), "ClinVar",
-                                                                   grepl("SP", term), "SIFT/PolyPhen",
-                                                                   grepl("MA", term), "MutationAssessor",
-                                                                   grepl("AM", term), "AlphaMissense",
+                                                                  
                                                                    grepl("gene_of_interest", term), "Gene",
-                                                                   default=sub("_RescueRescued_Benign|_RescueRescued_Oncogenic", "", term))]
+                                                                   default="Other")]
   
   #coefs_rescued <- coefs_rescued[, ann_type := relevel(as.factor(ann_type), ref="Gene")]
   
@@ -464,4 +395,199 @@ createPlotDFs <- function(surv_list, gene_to_run){
   
   return(returnlist)
   
+}
+
+
+getpercent <- function(x) { return(round(x*100, 2)) }
+
+# create a comparison df where all oncogenic + reclassified oncogenic mutations in all genes within a pathway count. 
+# basically set up a fisher's test where it's known oncogenic vs. known oncogenic + reclassified oncogenic 
+createReclassifiedGAMs <- function(tmp, method, gene_list){
+  
+  # pathway <- pathway_data$NRF2
+  # method <- methods[1]
+  
+  # tmp <- Reduce(function(x,y) merge(x,y, by="SAMPLE_ID", all=T), pathway)
+  tmpgam <- tmp[, c("SAMPLE_ID", grep(paste0(method, "_Rescue"), colnames(tmp), value=T)), with=F]
+  
+  tmpgam <- tmpgam[, grep(paste0(method, "_"), colnames(tmpgam), value=T, fixed=T) := lapply(.SD, function(x) ifelse(x %in% c("Rescued_Oncogenic"), 1, 0)), .SDcols=grep(paste0(method, "_"), colnames(tmpgam), value=T)]
+  
+  tmpgam <- setnames(tmpgam, colnames(tmpgam), gsub(paste0("_", method, "_Rescue"), "", colnames(tmpgam)))
+  
+  tmpgam <- setnames(tmpgam, "SAMPLE_ID", "Tumor_Sample_Barcode")
+  
+  tmpgam <- rbind(tmpgam, gam_oncogenic[Tumor_Sample_Barcode %in% tmpgam$Tumor_Sample_Barcode, ][, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", gene_list), with=F], use.names=T, fill=T)
+  
+  tmpgam[is.na(tmpgam)] <- 0
+  
+  tmpgam <- unique(tmpgam[, lapply(.SD, sum), by=.(Tumor_Sample_Barcode), .SDcols=gene_list])
+  
+  return(tmpgam)
+  
+}
+
+
+testMutualExclusivity <- function(pathway, gene_list, side1, side2, pairwise=T, oncokb_included=T, methods){
+  
+  tmp <- Reduce(function(x,y) merge(x,y, by="SAMPLE_ID", all=T), pathway)
+  print(colnames(tmp))
+  
+  gene_results <- list()
+  for (g in 1:length(gene_list)){
+    anchor_gene <- gene_list[g] # one gene at a time
+    print(anchor_gene)
+    other_genes <- gene_list # test all other genes
+    
+    tmp_anchor <- tmp[, unique(c("SAMPLE_ID", 
+                                 grep("Hugo_Symbol", colnames(tmp), value=T),
+                                 grep(anchor_gene, colnames(tmp), value=T))), 
+                      with=F]
+    
+    anchor_column <- paste0(anchor_gene, "_oncogenic_numeric")
+    
+    method_results <- list()
+    
+    for (i in 1:length(methods)){
+      rescue_method <- methods[i]
+      print(rescue_method)
+      
+      if (side2 == "oncogenic") {
+        if (rescue_method == "oncogenic"){
+          tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_column) == 1, 1, 0)] 
+          newgam <- gam_oncogenic[, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", other_genes), with=F]
+          
+        } else if (oncokb_included == T & rescue_method != "oncogenic") { # known + reclassified oncogenic vs known + reclassified oncogenic
+          anchor_rescue <- paste0(anchor_gene,  "_", rescue_method, "_Rescue") 
+          tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_rescue) ==  "Rescued_Oncogenic" | get(anchor_column) == 1, 1, 0)]
+          newgam <- createReclassifiedGAMs(tmp, rescue_method, other_genes) 
+          
+        } else if (oncokb_included == F  & rescue_method != "oncogenic"){ # reclassified oncogenic vs known oncogenic
+          anchor_rescue <- paste0(anchor_gene,  "_", rescue_method, "_Rescue") 
+          tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_rescue)  == "Rescued_Oncogenic", 1, 0)]
+          newgam <- gam_oncogenic[, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", other_genes), with=F]
+        }
+        
+      } else if (side2 == "benign") {
+        if (rescue_method == "oncogenic"){
+          tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_column) == 0, 1, 0)] 
+          newgam <- gam_oncogenic[, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", other_genes), with=F]
+          
+        } else if (oncokb_included == T & rescue_method != "oncogenic") {
+          anchor_rescue <- paste0(anchor_gene,  "_", rescue_method, "_Rescue") 
+          tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_rescue)  == "Rescued_Benign" | get(anchor_column) == 0, 1, 0)]
+          newgam <- createReclassifiedGAMs(tmp, rescue_method, other_genes)
+          
+        } else if (oncokb_included == F  & rescue_method != "oncogenic"){
+          anchor_rescue <- paste0(anchor_gene,  "_", rescue_method, "_Rescue") 
+          tmp_anchor <- tmp[, anchor_gene_altered := ifelse(get(anchor_rescue) == "Rescued_Benign", 1, 0)]
+          newgam <- gam_oncogenic[, colnames(gam_oncogenic) %in% c("Tumor_Sample_Barcode", other_genes), with=F]
+        }
+        
+      }
+      
+      tmp_anchor <- merge(tmp_anchor,
+                          newgam,
+                          by.x="SAMPLE_ID", by.y="Tumor_Sample_Barcode")
+      
+      other_genes_included <- intersect(other_genes, colnames(tmp_anchor))
+      
+      tmp_anchor <- tmp_anchor[, other_gene_altered := as.integer(rowSums(.SD != 0) > 0),
+                               .SDcols=other_genes_included]
+      
+      if (pairwise == T){
+        tmp_anchor_subset <- lapply(other_genes_included, function(x) table(tmp_anchor[, c("anchor_gene_altered", x), with=F]))
+        names(tmp_anchor_subset) <- other_genes_included
+        tmp_anchor_subset <- tmp_anchor_subset[which(sapply(tmp_anchor_subset, function(x) identical(dim(x), dim(ref_matrix))) == T)]
+        test_df <- lapply(tmp_anchor_subset, function(x) setDT(tidy(fisher.test(x, alternative = "two.sided"))))
+        if (length(test_df) > 0){
+          for (t in 1:length(test_df)){
+            test_df[[t]] <- test_df[[t]][, `:=`(anchor_gene = anchor_gene, 
+                                                test_gene = names(tmp_anchor_subset)[t],
+                                                method = rescue_method)]
+          }
+          test_df <- rbindlist(test_df)
+        } else { test_df <- NULL }
+        
+        
+      } else {
+        
+        testxtab <- table(tmp_anchor[, .(anchor_gene_altered, other_gene_altered)])
+        
+        if (0 %in% testxtab) {
+          testxtab <-  testxtab + 0.5
+        } 
+        
+        print(testxtab)
+        
+        if (identical(dim(testxtab), dim(ref_matrix))){
+          test_df <- setDT(tidy(fisher.test(testxtab, alternative = "two.sided")))
+          test_df <- test_df[, `:=`(gene = anchor_gene, method = rescue_method)]
+        } else { test_df <- NULL }
+      }
+      
+      method_results[[i]] <- test_df
+      
+    }
+    
+    gene_results[[g]] <- rbindlist(method_results)
+    
+  }
+  
+  results_df <- rbindlist(gene_results)[, `:=`(logOR = log(estimate),
+                                               logOR_lowCI = log(conf.low),
+                                               logOR_highCI = log(conf.high),
+                                               anchor_gene_mutations_included = side2)]
+  
+  return(results_df)
+  
+}
+
+
+processGeneList <- function(pathway, maf, clinical){
+  
+  gene_list <- intersect(pathways_df[Pathway == pathway, ]$Gene, unique(all_missense_process_nsclc$Hugo_Symbol))
+  
+  tmp_gene_process <- list()
+  
+  for (g in 1:length(gene_list)){
+    tmp_gene_process[[g]] <- prepareGenomicDF(maf = maf, clinical = clinical, gene=gene_list[g])[[1]]
+    tmp_gene_process[[g]] <- tmp_gene_process[[g]][, grepl("numeric|Hugo_Symbol|HGVSp_Short|SAMPLE_ID|_Rescue|", colnames(tmp_gene_process[[g]])), with=F]
+    tmp_gene_process[[g]] <- setnames(tmp_gene_process[[g]], colnames(tmp_gene_process[[g]]), paste0(gene_list[g], "_", colnames(tmp_gene_process[[g]])))
+    tmp_gene_process[[g]] <- setnames(tmp_gene_process[[g]], paste0(gene_list[g], "_SAMPLE_ID"), "SAMPLE_ID")
+  }
+  
+  return(tmp_gene_process)
+  
+}
+
+resultDTProcess <- function(tmp_results, tmpp){
+  tmp_results <- tmp_results[, pval.adj := p.adjust(p.value, method = "fdr")][, pathway := tmpp]
+  tmp_count <- tmp_results[, length(which(pval.adj <= 0.1 & estimate < 1 | pval.adj <= 0.1 & is.infinite(estimate)))/length(tmp_gene_list), by=c("method", "pathway")]
+  tmp_count <- tmp_count[, method := case.(grepl("oncogenic", method), "OncoKB",
+                                           grepl("CADD", method), "CADD",
+                                           grepl("Clinvar", method), "ClinVar",
+                                           grepl("SIFT", method), "SIFT",
+                                           grepl("PolyPhen", method), "PolyPhen",
+                                           grepl("MA", method), "MutationAssessor",
+                                           grepl("AM", method), "AlphaMissense",
+                                           grepl("REVEL", method), "REVEL",
+                                           default=method)]
+  return(list(results=tmp_results, count=tmp_count))
+}
+
+
+resultListProcess <- function(results_df, count_df) {
+  pathway_results_df <- rbindlist(results_df)
+  
+  pathway_count_df <- merge(pathway_results_df[, length(which(pval.adj <= 0.1 & estimate < 1 | pval.adj <= 0.1 & is.infinite(estimate))), by=c("method", "pathway")],
+                            pathway_results_df[, max(length(unique(gene))), by=c("pathway")], by="pathway")[, V1 := V1.x/V1.y]
+  
+  
+  pathway_count_df <- pathway_count_df[, method := ifelse(grepl("oncogenic", method), "OncoKB", method)]
+  
+  pathway_count_df <- pathway_count_df[, method := relevel(factor(method), ref="OncoKB")]
+  
+  pathway_count_df <- pathway_count_df[, pathway := sub("_", " ", pathway)]
+  
+  return(list(results=pathway_results_df, count=pathway_count_df))
 }
