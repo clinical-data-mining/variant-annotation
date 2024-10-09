@@ -2,19 +2,19 @@
 
 This is the code repository accompanying the manuscript *Machine learning cancer driver mutation predictions are valid in real-world data* (Tran et al., 2024). Description of the project is [here](https://www.abstractsonline.com/pp8/#!/20272/presentation/9170). Preprint is [here](https://www.biorxiv.org/content/10.1101/2024.03.31.587410v2).
 
+## Introduction
+
+This codebase consists of three R notebooks that perform benchmarking tasks for multiple variant effect predictor (VEP) tools, focusing on survival outcomes, pathway mutual exclusivity, and occurrence at binding residues using real-world cancer data. These notebooks are designed to replicate the findings described in the manuscript and can be run with new data with similar format as the sample data we provided in `data`. 
+
+We do not provide scripts to annotate variants with VEPs here, as the annotations can be more easily incorporated into upstream bioinformatic workflows e.g. with Ensembl VEP, or using the platforms recommended by the authors of individual methods. For researchers interested in annotating their data with multiple VEPs using pre-calculated scores, we recommend [dbNSFP](http://database.liulab.science/dbNSFP) (Liu et al., 2023) and [OpenCRAVAT](https://opencravat.org/) (Pagel et al., 2020) as two open-source, frequently updated resources. 
+
 ## Requirements
 
 All analyses for the manuscript were performed in `R 4.2.2` (2022-10-21) and the following package versions: data.table_1.14.6, survival_3.5-3, survminer_0.4.9, survey_4.1-1, WeightIt_0.13.1, ggplot2_3.4.4, forcats_1.0.0, ranger_0.15.1, tidytext_0.4.1, RColorBrewer_1.1-3, stringr_1.5.0, stringdist_0.9.10, Matrix_1.5-1, cowplot_1.1.1, cobalt_4.4.1, ggpubr_0.6.0, here_1.0.1, tidytable_0.9.2, corrplot_0.92, xtable_1.8-4       
 
 Installation of all dependencies should not take more than 30 minutes.
 
-# Introduction
-
-This codebase consists of three R notebooks that perform benchmarking tasks for multiple variant effect predictor (VEP) tools, focusing on survival outcomes, pathway mutual exclusivity, and occurrence at binding residues using real-world cancer data. These notebooks are designed to replicate the findings described in the manuscript and can be run with new data with similar format as the sample data we provided in `data`. 
-
-We do not provide scripts to annotate variants with VEPs here, as the annotations can be more easily incorporated into upstream bioinformatic workflows e.g. with Ensembl VEP, or using the platforms recommended by the authors of individual methods. For researchers interested in annotating their data with multiple VEPs using pre-calculated scores, we recommend [dbNSFP](http://database.liulab.science/dbNSFP) (Liu et al., 2023) and [OpenCRAVAT](https://opencravat.org/) (Pagel et al., 2020) as two open-source, frequently updated resources. 
-
-## How to run the code:
+## How to run 
 Set up and load data: Load the clinical data, MAF file, and optional GAM using fread() from the data.table package. Analyses can be run from individual Rmd files. 
 
 ### Binding residue enrichment (`binding_reclassified_mutation.Rmd`)
@@ -46,11 +46,17 @@ Set up and load data: Load the clinical data, MAF file, and optional GAM using f
 
 --msk_impact_gam.csv: flat file containing the gene alteration matrix, which is a binary matrix with samples as rows and genes as columns. A cell takes value 1 if a gene is altered in a sample, and 0 otherwise.
 
+--BioLiP_PPI_processed.RData: data table containing pre-processed [BioLiP](https://zhanggroup.org/BioLiP/index.cgi) and [PPI-HotspotDB](https://pubs.acs.org/doi/10.1021/acs.jcim.2c00025) databases
+
+--Pathways.Rdata: R datafile containing gene lists of oncogenic signaling pathways in Sanchez-Vega (2018)
+
 ### src
 
 --OS_reclassified_mutation.Rmd: run weighted OS analysis stratified by reclassified mutational status
 
 --pathway_mutual_exclusivity.Rmd: run mutual exclusivity analysis for oncogenic pathways in Sanchez-Vega (2018)
+
+--binding_reclassified_mutation.Rmd: run Fisher's tests to test for enrichment of reclassified oncogenic mutations at binding residues
 
 --utils.R: custom functions underlying analyses
 
