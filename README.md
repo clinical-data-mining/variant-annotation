@@ -22,7 +22,7 @@ Set up and load data: Load the clinical data, MAF file, and optional GAM using f
 
 - Visualization: Plotting the results for different genes and methods, highlighting the proportion of mutations predicted to be oncogenic at binding residues and the statistical significance of these predictions.
 
-- Performance metrics: Calculating odds ratios (OR) for reclassified mutations to assess the ability of various tools to distinguish pathogenic from benign mutations.
+- Performance metrics: Calculating odds ratios (OR) for reclassified mutations to assess the ability of different VEPs to distinguish pathogenic  from benign mutations.
 
 ### Survival outcome analysis (`OS_reclassified_mutation.Rmd`)
 - Run Cox PH models: Define the genes of interest and use the weightedSurvivalGeneList function to stratify outcomes based on mutational status. This will run a series of Cox PH models for each gene and compile the results.
@@ -34,7 +34,11 @@ Set up and load data: Load the clinical data, MAF file, and optional GAM using f
 - Calculate relative risk (RR): For a gene of interest, calculate the RR of survival between reclassified pathogenic and benign mutations using the results of the previous analyses in order to compare VEP performance in identifying prognostic reclassified pathogenic mutations.
 
 ### Pathway mutual exclusivity analysis (`pathway_mutual_exclusivity.Rmd`)
+- Run Fisher's tests for mutual exclusivity between reclassified oncogenic mutations vs. all other known oncogenic mutations: Given a list of genes within each pathway (we provided the gene lists for oncogenic signaling pathways defined in Sanchez-Vega et al. in `data/Pathways.Rdata`), the notebook uses a custom testMutualExclusivity function to run a series of Fisher's tests to test for mutual exclusivity between reclassified pathogenic mutations in each gene with other known oncogenic mutations in other genes within the same pathway
 
+- Run control tests: the same Fisher's tests are run to test for mutual exclusivity between reclassified benign mutations in each gene with other known oncogenic mutations in other genes within the same pathway
+
+- Performance metrics: Calculating odds ratios (OR_binding) of reclassified oncogenic mutations, compared to reclassified benign mutations, being mutually exclusive with other known oncogenic mutations in the same pathway.
 
 ## Repository components
 
@@ -46,15 +50,15 @@ Set up and load data: Load the clinical data, MAF file, and optional GAM using f
 
 --msk_impact_gam.csv: flat file containing the gene alteration matrix, which is a binary matrix with samples as rows and genes as columns. A cell takes value 1 if a gene is altered in a sample, and 0 otherwise.
 
---BioLiP_PPI_processed.RData: data table containing pre-processed [BioLiP](https://zhanggroup.org/BioLiP/index.cgi) and [PPI-HotspotDB](https://pubs.acs.org/doi/10.1021/acs.jcim.2c00025) databases
+--BioLiP_PPI_processed.RData: R datafile containing pre-processed [BioLiP](https://zhanggroup.org/BioLiP/index.cgi) and [PPI-HotspotDB](https://pubs.acs.org/doi/10.1021/acs.jcim.2c00025) databases
 
---Pathways.Rdata: R datafile containing gene lists of oncogenic signaling pathways in Sanchez-Vega (2018)
+--Pathways.Rdata: R datafile containing gene lists of oncogenic signaling pathways in Sanchez-Vega et al. (2018)
 
 ### src
 
 --OS_reclassified_mutation.Rmd: run weighted OS analysis stratified by reclassified mutational status
 
---pathway_mutual_exclusivity.Rmd: run mutual exclusivity analysis for oncogenic pathways in Sanchez-Vega (2018)
+--pathway_mutual_exclusivity.Rmd: run mutual exclusivity analysis for oncogenic pathways in Sanchez-Vega et al. (2018)
 
 --binding_reclassified_mutation.Rmd: run Fisher's tests to test for enrichment of reclassified oncogenic mutations at binding residues
 

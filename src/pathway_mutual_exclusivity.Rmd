@@ -164,8 +164,6 @@ ggplot(unique(fishers[!method %in% c("ClinVar", "oncogenic", "BoostDM"),]),
   rotate_x_text(angle=45)+
   labs(x="Method", y="Odds ratio of mutual exclusivity of\n reclassified oncogenic vs. reclassified benign mutations")
 
-ggsave(file="expanded_manuscript/Final_Figures/Raw_PDFs/pathway_exclusivity_results_or_1001.pdf",
-       width=7,  height=4.5, units="in")
 
 
 ```
